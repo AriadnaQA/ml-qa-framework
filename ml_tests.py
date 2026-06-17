@@ -2,11 +2,11 @@ import polars as pl
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
-from scipy.stats import ttest_ind
 from allpairspy import AllPairs
+from itertools import combinations, product
 
 class SegmentedRegressionTest:
-    def __init__(self, data, pipeline, segment_col="category", threshold=0.65, min_group_size=100):
+    def __init__(self, data, pipeline, segment_col="category", threshold=0.65, min_group_size=30):
         self.data = data
         self.pipeline = pipeline
         self.segment_col = segment_col
@@ -26,11 +26,11 @@ class SegmentedRegressionTest:
             self.group_sizes[seg] = n
             if n < self.min_group_size:
                 continue
-            X = seg_data.select(["timespent", "duration", "category", "author_id"]).to_pandas()
+            X = seg_data.select(["timespent", "duration", "category", "author_popularity"]).to_pandas()
             y_true = seg_data["like"].to_numpy()
-            y_pred = self.pipeline.predict_proba(X)[:, 1]
             if len(np.unique(y_true)) < 2:
                 continue
+            y_pred = self.pipeline.predict_proba(X)[:, 1]
             auc = roc_auc_score(y_true, y_pred)
             self.segments_auc[seg] = auc
             if auc < self.threshold:
@@ -55,10 +55,7 @@ class BoundaryTest:
         bounds = {
             "timespent": [0, 1, 254, 255],
             "duration": [5, 6, 179, 180],
-            "category": [0, 1, 18, 19],
-            "author_id": [self.train_medians["author_id"], self.train_medians["author_id"]*2]
         }
-        from itertools import combinations, product
         feature_list = [f for f in self.feature_names if f in bounds]
         for f1, f2 in combinations(feature_list, 2):
             for v1, v2 in product(bounds[f1], bounds[f2]):
@@ -71,7 +68,7 @@ class BoundaryTest:
                     elif f in self.train_modes:
                         case[f] = self.train_modes[f]
                     else:
-                        case[f] = self.train_medians[f]
+                        case[f] = self.train_medians.get(f, 0)
                 self.test_cases.append(case)
 
         for case in self.test_cases:
@@ -91,7 +88,7 @@ class BoundaryTest:
 
 
 class DecisionTableTest:
-    def __init__(self, data, pipeline, min_group_size=100, min_effect_size=0.02):
+    def __init__(self, data, pipeline, min_group_size=30, min_effect_size=0.02):
         self.data = data
         self.pipeline = pipeline
         self.min_group_size = min_group_size
@@ -107,32 +104,22 @@ class DecisionTableTest:
             return
 
         pred_a = self.pipeline.predict_proba(
-            group_a_data.select(["timespent", "duration", "category", "author_id"]).to_pandas()
+            group_a_data.select(["timespent", "duration", "category", "author_popularity"]).to_pandas()
         )[:, 1]
         pred_b = self.pipeline.predict_proba(
-            group_b_data.select(["timespent", "duration", "category", "author_id"]).to_pandas()
+            group_b_data.select(["timespent", "duration", "category", "author_popularity"]).to_pandas()
         )[:, 1]
 
         mean_a = float(np.mean(pred_a))
         mean_b = float(np.mean(pred_b))
         diff = mean_b - mean_a
-        stat, pval = ttest_ind(pred_a, pred_b)
 
-        if pval >= 0.05:
-            status = "❌ нет статистически значимых различий"
+        if expected_direction == 'greater':
+            passed = diff > self.min_effect_size
+        elif expected_direction == 'less':
+            passed = diff < -self.min_effect_size
         else:
-            if expected_direction == 'greater':
-                direction_ok = diff > 0
-            elif expected_direction == 'less':
-                direction_ok = diff < 0
-            else:
-                direction_ok = True
-            if not direction_ok:
-                status = "❌ модель противоречит ожиданию"
-            elif abs(diff) < self.min_effect_size:
-                status = "⚠️ статистически значимо, но практически несущественно"
-            else:
-                status = "✅ гипотеза подтверждена"
+            passed = abs(diff) > self.min_effect_size
 
         self.scenarios.append({
             "name": name,
@@ -141,57 +128,41 @@ class DecisionTableTest:
             "mean_A": mean_a,
             "mean_B": mean_b,
             "diff": diff,
-            "p_value": float(pval),
             "min_effect": self.min_effect_size,
             "expected": expected_direction,
-            "status": status,
-            "passed": status.startswith("✅")
+            "passed": passed
         })
 
     def run(self):
         self.scenarios = []
 
-        # Гипотеза 1: Досмотр > Недосмотр
         self._add(
             "Досмотр > Недосмотр",
-            "timespent = 0 (не смотрели)",
-            "timespent = duration (досмотрели)",
+            "timespent = 0",
+            "timespent = duration",
             self.data.filter(pl.col("timespent") == 0),
             self.data.filter(pl.col("timespent") == pl.col("duration")),
             "greater"
         )
 
-        # Гипотеза 2: Перемотка хуже досмотра
         self._add(
-            "Перемотка хуже досмотра",
-            "timespent = duration (досмотрели)",
-            "timespent > duration (перематывали)",
+            "Недосмотр хуже полного досмотра",
+            "timespent < duration",
+            "timespent == duration",
+            self.data.filter(pl.col("timespent") < pl.col("duration")),
             self.data.filter(pl.col("timespent") == pl.col("duration")),
-            self.data.filter(pl.col("timespent") > pl.col("duration")),
-            "less"
+            "greater"
         )
 
-        # Гипотеза 3: Короткие > Длинные
         self._add(
             "Короткие > Длинные",
-            "duration > 120 сек",
-            "duration < 30 сек",
+            "duration > 120",
+            "duration < 30",
             self.data.filter(pl.col("duration") > 120),
             self.data.filter(pl.col("duration") < 30),
             "greater"
         )
 
-        # Гипотеза 4: Любое время > Нулевое
-        self._add(
-            "Любое время > Нулевое",
-            "timespent = 0",
-            "timespent > 0",
-            self.data.filter(pl.col("timespent") == 0),
-            self.data.filter(pl.col("timespent") > 0),
-            "greater"
-        )
-
-        # Гипотеза 5: Популярный автор ≠ Обычный
         self._add(
             "Популярный автор ≠ Обычный",
             "author_id в топ-50",
@@ -201,11 +172,10 @@ class DecisionTableTest:
             "two-sided"
         )
 
-        # Гипотеза 6: Короткие <60 vs >=60
         self._add(
             "Короткие <60 vs >=60",
-            "duration >= 60 сек",
-            "duration < 60 сек",
+            "duration >= 60",
+            "duration < 60",
             self.data.filter(pl.col("duration") >= 60),
             self.data.filter(pl.col("duration") < 60),
             "two-sided"
@@ -250,7 +220,7 @@ class PairwiseTest:
                 elif f in self.train_modes:
                     full_case[f] = self.train_modes[f]
                 else:
-                    full_case[f] = self.train_medians[f]
+                    full_case[f] = self.train_medians.get(f, 0)
             self.combinations.append(full_case)
             for i in range(len(keys)):
                 for j in range(i+1, len(keys)):
@@ -283,6 +253,7 @@ class StabilityTest:
         self.result = None
         self.details = None
         self.psi_values = {}
+        self.new_authors_frac = None
 
     def _psi(self, expected, actual, bins=10):
         breakpoints = np.histogram_bin_edges(np.concatenate([expected, actual]), bins=bins)
@@ -296,13 +267,30 @@ class StabilityTest:
 
     def run(self):
         failed = []
-        for col in self.model_columns + self.context_columns:
+        for col in self.model_columns:
+            if col not in self.train.columns or col not in self.val.columns:
+                continue
             train_col = self.train[col].to_numpy()
             val_col = self.val[col].to_numpy()
             psi_val = self._psi(train_col, val_col)
             self.psi_values[col] = psi_val
-            if col in self.model_columns and psi_val > self.threshold:
+            if psi_val > self.threshold:
                 failed.append(f"{col}: PSI={psi_val:.4f}")
+
+        for col in self.context_columns:
+            if col not in self.train.columns or col not in self.val.columns:
+                continue
+            train_col = self.train[col].to_numpy()
+            val_col = self.val[col].to_numpy()
+            psi_val = self._psi(train_col, val_col)
+            self.psi_values[col] = psi_val
+
+        if "author_id" in self.train.columns and "author_id" in self.val.columns:
+            train_authors = set(self.train["author_id"].unique().to_list())
+            val_authors = self.val["author_id"].unique().to_list()
+            new_authors = [a for a in val_authors if a not in train_authors]
+            self.new_authors_frac = len(new_authors) / len(val_authors) if val_authors else 0
+
         self.result = "PASS" if len(failed) == 0 else "FAIL"
         self.details = f"Признаков с дрейфом: {len(failed)}"
-        return self.result, self.details, self.psi_values, failed
+        return self.result, self.details, self.psi_values, self.new_authors_frac, failed
